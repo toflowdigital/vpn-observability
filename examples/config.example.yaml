@@ -1,0 +1,30 @@
+# Example configuration (sanitized)
+
+hostname: "vpn-gateway-1"
+
+remote_peers:
+  client-network-1: "192.0.2.10"
+  client-network-2: "198.51.100.10"
+
+check_direction: "both"   # both | in | out
+
+strongswan:
+  status_command: "sudo strongswan statusall"
+  up_command_prefix: "sudo strongswan up"
+
+timing:
+  retry_count: 3
+  retry_delay_seconds: 10
+  missing_retry_count: 5
+  missing_retry_delay_seconds: 1
+  sa_grace_period_seconds: 30
+
+logging:
+  log_file: "/var/log/strongswan_status_check.log"
+
+email:
+  enabled: false
+  sender: "ssmonitor@localhost"
+  recipients:
+    - "example@example.com"
+  smtp_server: "203.0.113.25"

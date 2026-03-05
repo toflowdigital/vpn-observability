@@ -9,11 +9,24 @@ Includes tools for:
 - IPsec SA debugging
 - Cisco DMVPN health checks
 
+---
+
 ## Problem
 
-`strongswan statusall` can briefly report `0 bytes_o` or `0 bytes_i`
-during SA rollover. Monitoring systems that treat this as a hard failure
-can trigger false alerts or bounce healthy tunnels.
+During IPsec rekey events, `strongswan statusall` may temporarily report
+`0 bytes_i` or `0 bytes_o` even when traffic is still flowing.
 
-This toolkit uses retry logic and kernel XFRM counters to distinguish
-between a real failure and transient rekey behavior.
+Monitoring systems that rely solely on these counters can generate false
+alerts or bounce healthy tunnels.
+
+This toolkit reduces those false positives by correlating StrongSwan
+output with kernel XFRM counters.
+
+---
+
+## Usage
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt

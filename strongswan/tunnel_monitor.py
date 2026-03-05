@@ -20,8 +20,8 @@ connections by name.
 
 from __future__ import annotations
 
+import argparse
 import logging
-import os
 import re
 import smtplib
 import subprocess
@@ -29,52 +29,96 @@ import sys
 import time
 from datetime import datetime
 from email.mime.text import MIMEText
-from typing import Dict, List, Tuple
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Any
+
+import yaml
 
 from strongswan.xfrm_fallback_check import fallback_xfrm_bytes
 
 
-# --- basic configuration (replace with YAML later) ---
-REMOTE_PEERS: Dict[str, str] = {
-    "client-network-1": "10.0.5.100",
-}
+def cfg_get(cfg: Dict[str, Any], path: str, default: Any = None) -> Any:
+    cur: Any = cfg
+    for part in path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return default
+        cur = cur[part]
+    return cur
 
-HOSTNAME = "10G-LM-VPC5-SS-GW"
-SENDER = "ssmonitor@localhost"
-RECIPIENTS = ["example@example.com"]
-SMTP_SERVER = "172.16.5.149"
 
-CHECK_DIRECTION = "both"  # options: both, in, out
-HEALTHCHECK_MODE = os.getenv("HEALTHCHECK_MODE", "0") == "1"
-STATUS_COMMAND = "sudo strongswan statusall"
+def load_config(path: str) -> Dict[str, Any]:
+    p = Path(path).expanduser()
+    with p.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
 
-RETRY_COUNT = 3
-RETRY_DELAY_SECONDS = 10
-MISSING_RETRY_COUNT = 5
-MISSING_RETRY_DELAY = 1
-SA_GRACE_PERIOD_SECONDS = 30
 
-LOG_FILE = "/var/log/strongswan_status_check.log"
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="StrongSwan tunnel monitor with XFRM fallback.")
+    parser.add_argument("--config", required=True, help="Path to YAML config file")
+    parser.add_argument(
+        "--mode",
+        choices=["check", "bounce", "report"],
+        default="check",
+        help="check=exit code only, bounce=auto-bounce unhealthy, report=email report if enabled",
+    )
+    parser.add_argument(
+        "--direction",
+        choices=["both", "in", "out"],
+        default=None,
+        help="Override check_direction from config",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Do not bounce tunnels; print what would happen",
+    )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Override log file path (useful for local testing)",
+    )
+    return parser.parse_args()
 
-def setup_logging() -> None:
-    if not os.path.exists(LOG_FILE):
-        open(LOG_FILE, "w").close()
+
+def setup_logging(log_file: str) -> None:
+    log_path = Path(log_file).expanduser()
+
+    if not log_path.exists():
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.touch()
+        except PermissionError:
+            # Fallback for local testing without privileges.
+            log_path = Path("./strongswan_status_check.log")
+            log_path.touch()
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
-        filename=LOG_FILE,
+        filename=str(log_path),
         filemode="a",
     )
 
 
-def send_email(subject: str, body: str) -> None:
+def send_email(cfg: Dict[str, Any], subject: str, body: str) -> None:
+    if not cfg_get(cfg, "email.enabled", False):
+        return
+
+    sender = cfg_get(cfg, "email.sender", "ssmonitor@localhost")
+    recipients = cfg_get(cfg, "email.recipients", [])
+    smtp_server = cfg_get(cfg, "email.smtp_server", "localhost")
+
+    if not recipients:
+        logging.warning("Email enabled but no recipients configured; skipping email.")
+        return
+
     msg = MIMEText(body)
     msg["Subject"] = subject
-    msg["From"] = SENDER
-    msg["To"] = ", ".join(RECIPIENTS)
-    with smtplib.SMTP(SMTP_SERVER) as server:
-        server.sendmail(SENDER, RECIPIENTS, msg.as_string())
+    msg["From"] = sender
+    msg["To"] = ", ".join(recipients)
+
+    with smtplib.SMTP(smtp_server) as server:
+        server.sendmail(sender, recipients, msg.as_string())
 
 
 def ping_peer(peers: Dict[str, str]) -> None:
@@ -82,17 +126,23 @@ def ping_peer(peers: Dict[str, str]) -> None:
         subprocess.run(f"ping {ip_address} -c 3 > /dev/null 2>&1", shell=True)
 
 
-def tunnel_bounce(tunnels_to_bounce: List[str]) -> None:
+def tunnel_bounce(cfg: Dict[str, Any], tunnels_to_bounce: List[str], dry_run: bool) -> None:
+    up_prefix = cfg_get(cfg, "strongswan.up_command_prefix", "sudo strongswan up")
     for tunnel_name in tunnels_to_bounce:
+        cmd = f"{up_prefix} {tunnel_name} > /dev/null 2>&1"
         logging.warning("Bouncing tunnel: %s", tunnel_name)
-        subprocess.run(
-            f"sudo strongswan up {tunnel_name} > /dev/null 2>&1",
-            shell=True,
-            check=True,
-        )
+
+        if dry_run:
+            logging.warning("[dry-run] would run: %s", cmd)
+            continue
+
+        subprocess.run(cmd, shell=True, check=True)
 
 
-def _parse_statusall_for_tunnel(status_text: str, tunnel_name: str) -> Tuple[str | None, str | None, str | None, str | None, int, int]:
+def _parse_statusall_for_tunnel(
+    status_text: str,
+    tunnel_name: str,
+) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], int, int]:
     """
     Extract spi_i/spi_o + local_ip/remote_ip + bytes_i/bytes_o for a given connection.
     Returns (spi_i, spi_o, local_ip, remote_ip, bytes_i, bytes_o).
@@ -122,17 +172,22 @@ def _parse_statusall_for_tunnel(status_text: str, tunnel_name: str) -> Tuple[str
     return spi_i, spi_o, local_ip, remote_ip, bytes_i, bytes_o
 
 
-def safe_check_bytes(tunnel_name: str) -> Tuple[int, int]:
+def safe_check_bytes(cfg: Dict[str, Any], tunnel_name: str, direction: str) -> Tuple[int, int]:
     """
     Retry statusall a few times to tolerate rekeys, then fallback to XFRM if needed.
     Returns (bytes_i, bytes_o).
     """
+    retry_count = int(cfg_get(cfg, "timing.retry_count", 3))
+    retry_delay = int(cfg_get(cfg, "timing.retry_delay_seconds", 10))
+    sa_grace = int(cfg_get(cfg, "timing.sa_grace_period_seconds", 30))
+    status_cmd = cfg_get(cfg, "strongswan.status_command", "sudo strongswan statusall")
+
     spi_i = spi_o = local_ip = remote_ip = None
     bytes_i = bytes_o = 0
 
-    for _ in range(RETRY_COUNT):
+    for _ in range(retry_count):
         status_result = subprocess.run(
-            STATUS_COMMAND,
+            status_cmd,
             shell=True,
             check=True,
             stdout=subprocess.PIPE,
@@ -144,12 +199,12 @@ def safe_check_bytes(tunnel_name: str) -> Tuple[int, int]:
             status_result.stdout, tunnel_name
         )
 
-        if (CHECK_DIRECTION == "both" and bytes_i > 0 and bytes_o > 0) or \
-           (CHECK_DIRECTION == "in" and bytes_i > 0) or \
-           (CHECK_DIRECTION == "out" and bytes_o > 0):
+        if (direction == "both" and bytes_i > 0 and bytes_o > 0) or \
+           (direction == "in" and bytes_i > 0) or \
+           (direction == "out" and bytes_o > 0):
             return bytes_i, bytes_o
 
-        time.sleep(RETRY_DELAY_SECONDS)
+        time.sleep(retry_delay)
 
     # fallback to XFRM after retries
     if spi_i and spi_o and local_ip and remote_ip:
@@ -164,22 +219,26 @@ def safe_check_bytes(tunnel_name: str) -> Tuple[int, int]:
             tunnel_name, spi_i, xfrm_i, spi_o, xfrm_o, age_str
         )
 
-        if (CHECK_DIRECTION == "both" and xfrm_i > 0 and xfrm_o > 0) or \
-           (CHECK_DIRECTION == "in" and xfrm_i > 0) or \
-           (CHECK_DIRECTION == "out" and xfrm_o > 0):
+        if (direction == "both" and xfrm_i > 0 and xfrm_o > 0) or \
+           (direction == "in" and xfrm_i > 0) or \
+           (direction == "out" and xfrm_o > 0):
             return xfrm_i, xfrm_o
 
-        if age_min < SA_GRACE_PERIOD_SECONDS:
+        if age_min < sa_grace:
             logging.info("SA within grace period (%ss). Skipping bounce.", int(age_min))
             return xfrm_i, xfrm_o
 
     return bytes_i or 0, bytes_o or 0
 
 
-def missing_line_safe_check(tunnel_name: str) -> bool:
-    for _ in range(MISSING_RETRY_COUNT):
+def missing_line_safe_check(cfg: Dict[str, Any], tunnel_name: str) -> bool:
+    missing_retry_count = int(cfg_get(cfg, "timing.missing_retry_count", 5))
+    missing_retry_delay = int(cfg_get(cfg, "timing.missing_retry_delay_seconds", 1))
+    status_cmd = cfg_get(cfg, "strongswan.status_command", "sudo strongswan statusall")
+
+    for _ in range(missing_retry_count):
         status_result = subprocess.run(
-            STATUS_COMMAND,
+            status_cmd,
             shell=True,
             check=True,
             stdout=subprocess.PIPE,
@@ -188,21 +247,26 @@ def missing_line_safe_check(tunnel_name: str) -> bool:
         )
         if tunnel_name in status_result.stdout:
             return True
-        time.sleep(MISSING_RETRY_DELAY)
+        time.sleep(missing_retry_delay)
     return False
 
 
-def tunnel_verification(statusall_text: str) -> List[str]:
+def tunnel_verification(
+    cfg: Dict[str, Any],
+    statusall_text: str,
+    remote_peers: Dict[str, str],
+    direction: str,
+) -> List[str]:
     broken_tunnels: List[str] = []
 
-    for tunnel_name in REMOTE_PEERS.keys():
+    for tunnel_name in remote_peers.keys():
         if tunnel_name in statusall_text:
-            b_i, b_o = safe_check_bytes(tunnel_name)
+            b_i, b_o = safe_check_bytes(cfg, tunnel_name, direction)
 
             unhealthy = (
-                (CHECK_DIRECTION == "both" and (b_i == 0 or b_o == 0)) or
-                (CHECK_DIRECTION == "in" and b_i == 0) or
-                (CHECK_DIRECTION == "out" and b_o == 0)
+                (direction == "both" and (b_i == 0 or b_o == 0)) or
+                (direction == "in" and b_i == 0) or
+                (direction == "out" and b_o == 0)
             )
 
             if unhealthy:
@@ -213,56 +277,63 @@ def tunnel_verification(statusall_text: str) -> List[str]:
 
         else:
             logging.warning("Tunnel %s not found in statusall output", tunnel_name)
-            if not missing_line_safe_check(tunnel_name):
+            if not missing_line_safe_check(cfg, tunnel_name):
                 broken_tunnels.append(tunnel_name)
 
     return broken_tunnels
 
 
-def run() -> int:
-    statusall_results = subprocess.run(
-        STATUS_COMMAND,
-        shell=True,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-    broken = tunnel_verification(statusall_results.stdout)
-
-    if HEALTHCHECK_MODE:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        if broken:
-            subject = f"[ALERT] Daily Tunnel Health Report - Issues Found at {now}"
-            body = f"The following tunnels are unhealthy: {', '.join(broken)}"
-        else:
-            subject = f"[OK][{HOSTNAME}] Daily Tunnel Health Report"
-            body = f"Hostname: {HOSTNAME}\nHealthy at {now}\nAll monitored tunnels are up and healthy."
-
-        send_email(subject, body)
-        logging.info("Daily health report sent.")
-        return 0
-
-    if broken:
-        print(f"\n{HOSTNAME}\nTunnels to bounce: {', '.join(broken)}")
-        tunnel_bounce(broken)
-        ping_peer({t: REMOTE_PEERS[t] for t in broken})
-        return 1
-
-    return 0
-
-
 def main() -> None:
-    setup_logging()
+    args = parse_args()
+    cfg = load_config(args.config)
+
+    direction = args.direction or cfg_get(cfg, "check_direction", "both")
+    mode = args.mode
+
+    log_file = args.log_file or cfg_get(cfg, "logging.log_file", "./strongswan_status_check.log")
+    setup_logging(log_file)
+
+    hostname = cfg_get(cfg, "hostname", "vpn-host")
+    remote_peers = cfg_get(cfg, "remote_peers", {})
+
     try:
-        rc = run()
-        sys.exit(rc)
+        status_cmd = cfg_get(cfg, "strongswan.status_command", "sudo strongswan statusall")
+        statusall_results = subprocess.run(
+            status_cmd,
+            shell=True,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        broken = tunnel_verification(cfg, statusall_results.stdout, remote_peers, direction)
+
+        if mode == "report":
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if broken:
+                subject = f"[ALERT] Tunnel Health Report - Issues Found at {now}"
+                body = f"Hostname: {hostname}\nUnhealthy tunnels: {', '.join(broken)}"
+            else:
+                subject = f"[OK][{hostname}] Tunnel Health Report"
+                body = f"Hostname: {hostname}\nHealthy at {now}\nAll monitored tunnels are up and healthy."
+            send_email(cfg, subject, body)
+            sys.exit(0)
+
+        if broken:
+            logging.warning("Unhealthy tunnels: %s", ", ".join(broken))
+            if mode == "bounce":
+                tunnel_bounce(cfg, broken, dry_run=args.dry_run)
+                ping_peer({t: remote_peers[t] for t in broken})
+            sys.exit(1)
+
+        sys.exit(0)
+
     except subprocess.CalledProcessError as e:
         logging.error("Command execution failed with return code %s", e.returncode)
         if getattr(e, "stderr", None):
             logging.error(e.stderr)
-        sys.exit(1)
+        sys.exit(2)
 
 
 if __name__ == "__main__":
