@@ -1,6 +1,6 @@
 # VPN Observability Toolkit
 
-Operational tooling for monitoring and debugging IPsec / VPN infrastructure.
+Operational tooling for monitoring and debugging IPsec / VPN infrastructure on Linux systems.
 
 Includes tools for:
 
@@ -30,5 +30,53 @@ Install dependencies:
 
 ```bash
 pip install -r requirements.txt
+```
 
+Run healthcheck
 
+```bash
+python strongswan/tunnel_monitor.py \
+  --config examples/config.example.yaml \
+  --mode check
+```
+
+bounce unhealthy tunnels
+```bash
+python strongswan/tunnel_monitor.py \
+  --config examples/config.example.yaml \
+  --mode bounce
+```
+
+dry run (no changes)
+```bash
+python strongswan/tunnel_monitor.py \
+  --config examples/config.example.yaml \
+  --mode bounce \
+  --dry-run
+```
+
+## Config
+
+See `examples/config.example.yaml` for a sanitized configuration example.
+
+## Architecture
+
+Monitoring flow:
+
+strongswan statusall
+        │
+        ▼
+parse SPI + peer IPs
+        │
+        ▼
+retry window to tolerate rekeys
+        │
+        ▼
+fallback to kernel XFRM counters
+(ip -s xfrm state get)
+        │
+        ▼
+determine tunnel health
+        │
+        ▼
+alert or bounce tunnel
