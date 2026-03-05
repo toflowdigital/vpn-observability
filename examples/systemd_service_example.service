@@ -1,0 +1,15 @@
+[Unit]
+Description=VPN Observability - StrongSwan Tunnel Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/vpn-observability
+ExecStart=/usr/bin/python3 /opt/vpn-observability/strongswan/tunnel_monitor.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
